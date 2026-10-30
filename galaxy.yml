@@ -1,0 +1,36 @@
+namespace: aknochow
+name: xai
+version: 0.1.0
+readme: README.md
+authors:
+  - Adam Knochowski <aknochow@gmail.com>
+description: Ansible collection that calls the xAI API (api.x.ai) via the official xai-sdk. Grok is the text model family on that API; the same API and key also cover image, video, and voice models.
+license:
+  - GPL-3.0-or-later
+  - Apache-2.0
+repository: https://github.com/aknochow/ansible-xai
+tags:
+  - grok
+  - xai
+  - ai
+  - llm
+dependencies: {}
+build_ignore:
+  - .git
+  - .github
+  - .agents
+  - .claude
+  - .ansible
+  - .ansible-lint
+  - .gitignore
+  - .pre-commit-config.yaml
+  - .pytest_cache
+  - .venv
+  - .yamllint
+  - __pycache__
+  - "*.egg-info"
+  - build
+  - dist
+  - hatch_build.py
+  - tests
+  - roles

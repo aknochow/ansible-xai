@@ -1,0 +1,12 @@
+---
+profile: min
+
+mock_modules:
+  - aknochow.openai.chat
+
+warn_list:
+  - ignore-errors
+
+exclude_paths:
+  - .venv/
+  - tests/

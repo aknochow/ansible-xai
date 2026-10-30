@@ -1,0 +1,13 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  collection-ci:
+    uses: aknochow/ansible-plaibook/.github/workflows/collection-ci.yml@main
+    with:
+      collection_name: xai
