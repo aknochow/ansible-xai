@@ -34,4 +34,10 @@ options:
       - Reserved for future SDK retry tuning. Currently documented for parity with sibling collections.
     type: int
     default: 2
+  conversation_id:
+    description:
+      - Stable id for one conversation. Sent as gRPC metadata C(x-grok-conv-id) on every call made with that client.
+      - Reuse it for every turn of the same conversation so prompt-cache lookups stay on one server.
+      - A different conversation, such as a separate verify loop, should use its own id.
+    type: str
 """

@@ -17,6 +17,7 @@ PROVIDER_ARGSPEC = dict(
     ),
     timeout=dict(type="float", default=900.0),
     max_retries=dict(type="int", default=2),
+    conversation_id=dict(type="str", required=False),
 )
 
 
@@ -40,9 +41,12 @@ def get_client(module: AnsibleModule):
         timeout = 900.0
 
     api_host = module.params.get("api_host") or "api.x.ai"
+    conversation_id = (module.params.get("conversation_id") or "").strip()
+    metadata = (("x-grok-conv-id", conversation_id),) if conversation_id else None
 
     return Client(
         api_key=api_key,
         api_host=api_host,
         timeout=timeout,
+        metadata=metadata,
     )

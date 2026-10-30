@@ -61,6 +61,29 @@ class TestGetClient:
             api_key="secret-key",
             api_host="api.x.ai",
             timeout=60.0,
+            metadata=None,
+        )
+
+    def test_conversation_id_sets_cache_metadata(self, mock_xai_sdk):
+        from ansible_collections.aknochow.xai.plugins.module_utils.grok_client import (
+            get_client,
+        )
+
+        module = MagicMock()
+        module.params = {
+            "api_key": "secret-key",
+            "api_host": "api.x.ai",
+            "timeout": 60.0,
+            "max_retries": 2,
+            "conversation_id": "review-1-explore",
+        }
+
+        get_client(module)
+        mock_xai_sdk.Client.assert_called_once_with(
+            api_key="secret-key",
+            api_host="api.x.ai",
+            timeout=60.0,
+            metadata=(("x-grok-conv-id", "review-1-explore"),),
         )
 
     def test_missing_api_key_fails(self, mock_xai_sdk):
