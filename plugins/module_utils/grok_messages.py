@@ -29,7 +29,7 @@ def _copy_encrypted(message: Any, item: dict[str, Any]) -> Any:
 
 def _tool_calls_from_openai(calls: Any) -> list[Any]:
     """Build SDK tool-call protos from OpenAI-shaped ``tool_calls``."""
-    from xai_sdk.proto.chat_pb2 import FunctionCall, ToolCall
+    from xai_sdk.proto import chat_pb2
 
     proto_calls = []
     for call in calls or []:
@@ -42,7 +42,12 @@ def _tool_calls_from_openai(calls: Any) -> list[Any]:
             args = function.get("arguments")
         if not isinstance(args, str):
             args = json.dumps(args if args is not None else {})
-        proto_calls.append(ToolCall(id=str(call.get("id") or ""), function=FunctionCall(name=str(name), arguments=args)))
+        proto_calls.append(
+            chat_pb2.ToolCall(
+                id=str(call.get("id") or ""),
+                function=chat_pb2.FunctionCall(name=str(name), arguments=args),
+            )
+        )
     return proto_calls
 
 
@@ -208,9 +213,7 @@ def fail_on_invalid_messages(module: AnsibleModule, messages: list[dict[str, Any
                 module.fail_json(msg=f"messages[{index}] image_detail requires image_urls")
                 return True
             if image_detail not in _IMAGE_DETAILS:
-                module.fail_json(
-                    msg=f"messages[{index}] image_detail must be one of: {', '.join(_IMAGE_DETAILS)}"
-                )
+                module.fail_json(msg=f"messages[{index}] image_detail must be one of: {', '.join(_IMAGE_DETAILS)}")
                 return True
     return False
 
