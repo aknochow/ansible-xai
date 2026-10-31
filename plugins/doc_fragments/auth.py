@@ -31,7 +31,9 @@ options:
     default: 900.0
   max_retries:
     description:
-      - Reserved for future SDK retry tuning. Currently documented for parity with sibling collections.
+      - Extra attempts after a transient gRPC failure. The first call is not counted.
+      - Retried statuses are UNAVAILABLE, INTERNAL, and RST_STREAM.
+      - A deadline is not retried. The xAI SDK itself only retries UNAVAILABLE, so this covers the rest.
     type: int
     default: 2
   conversation_id:

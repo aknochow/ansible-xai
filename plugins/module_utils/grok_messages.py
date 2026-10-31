@@ -20,15 +20,42 @@ def _message_text(content: Any) -> str:
     return json.dumps(content)
 
 
+def _copy_encrypted(message: Any, item: dict[str, Any]) -> Any:
+    encrypted = item.get("encrypted_content")
+    if isinstance(encrypted, str) and encrypted:
+        message.encrypted_content = encrypted
+    return message
+
+
+def _tool_calls_from_openai(calls: Any) -> list[Any]:
+    """Build SDK tool-call protos from OpenAI-shaped ``tool_calls``."""
+    from xai_sdk.proto.chat_pb2 import FunctionCall, ToolCall
+
+    proto_calls = []
+    for call in calls or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = call.get("name") or function.get("name") or ""
+        args = call.get("args")
+        if args is None:
+            args = function.get("arguments")
+        if not isinstance(args, str):
+            args = json.dumps(args if args is not None else {})
+        proto_calls.append(ToolCall(id=str(call.get("id") or ""), function=FunctionCall(name=str(name), arguments=args)))
+    return proto_calls
+
+
 def ansible_messages_to_proto(messages: list[dict[str, Any]]):
     """Convert OpenAI-shaped message dicts to xai_sdk chat protobuf messages.
 
     A user message may include ``image_urls`` (and optional ``image_detail``).
     Those become ``xai_sdk.chat.image`` parts on the same user turn. An
-    assistant message may include ``encrypted_content`` from an earlier
-    response; it is copied onto the proto unchanged. Other roles stay text-only.
+    assistant message may include ``encrypted_content`` and ``tool_calls`` from
+    an earlier response. A ``tool`` message is ``tool_result`` and keeps
+    ``tool_call_id``. Any other role stays user text.
     """
-    from xai_sdk.chat import assistant, image, system, user
+    from xai_sdk.chat import assistant, image, system, tool_result, user
 
     proto_messages = []
     for item in messages:
@@ -41,10 +68,13 @@ def ansible_messages_to_proto(messages: list[dict[str, Any]]):
             proto_messages.append(system(text))
         elif role == "assistant":
             message = assistant(text)
-            encrypted = item.get("encrypted_content")
-            if isinstance(encrypted, str) and encrypted:
-                message.encrypted_content = encrypted
+            _copy_encrypted(message, item)
+            if item.get("tool_calls"):
+                message.tool_calls.extend(_tool_calls_from_openai(item.get("tool_calls")))
             proto_messages.append(message)
+        elif role == "tool":
+            tool_call_id = item.get("tool_call_id") or None
+            proto_messages.append(tool_result(text, tool_call_id=tool_call_id))
         elif role == "user":
             parts: list[Any] = []
             if text or not image_urls:

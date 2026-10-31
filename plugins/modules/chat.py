@@ -268,16 +268,28 @@ def flatten_tool_calls(tool_calls):
     return flattened
 
 
+def _usage_int(usage, name):
+    value = getattr(usage, name, 0)
+    return value if isinstance(value, int) else 0
+
+
 def flatten_usage(usage):
     if usage is None:
-        return dict(prompt_tokens=0, completion_tokens=0, total_tokens=0, cached_tokens=0)
-    cached = getattr(usage, "cached_prompt_text_tokens", 0) or 0
+        return dict(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            cached_tokens=0,
+            reasoning_tokens=0,
+            cost_in_usd_ticks=0,
+        )
     return dict(
-        prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-        completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
-        total_tokens=getattr(usage, "total_tokens", 0) or 0,
-        cached_tokens=cached,
-        reasoning_tokens=getattr(usage, "reasoning_tokens", 0) or 0,
+        prompt_tokens=_usage_int(usage, "prompt_tokens"),
+        completion_tokens=_usage_int(usage, "completion_tokens"),
+        total_tokens=_usage_int(usage, "total_tokens"),
+        cached_tokens=_usage_int(usage, "cached_prompt_text_tokens"),
+        reasoning_tokens=_usage_int(usage, "reasoning_tokens"),
+        cost_in_usd_ticks=_usage_int(usage, "cost_in_usd_ticks"),
     )
 
 
@@ -320,6 +332,18 @@ def _or_default(value, default):
     if value is None:
         return default
     return value
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for a dropped stream the xAI SDK does not retry itself.
+
+    The SDK retries gRPC UNAVAILABLE. RST_STREAM and INTERNAL are not in that
+    set, and a deadline is not worth repeating.
+    """
+    if _deadline_exceeded(exc):
+        return False
+    text = str(exc)
+    return any(token in text for token in ("UNAVAILABLE", "RST_STREAM", "StatusCode.INTERNAL"))
 
 
 def _deadline_exceeded(exc: BaseException) -> bool:
@@ -391,6 +415,8 @@ def main():
         temperature=_or_default(module.params.get("temperature"), 0.7),
         top_p=_or_default(module.params.get("top_p"), 0.95),
         use_encrypted_content=_or_default(module.params.get("use_encrypted_content"), True),
+        # Each request already carries the full history. Do not keep a server copy.
+        store_messages=False,
     )
 
     stop_sequences = module.params.get("stop_sequences")
@@ -415,14 +441,25 @@ def main():
         create_kwargs["response_format"] = response_format
 
     parse_structured = schema is not None or bool(response_format_param)
+    max_retries = module.params.get("max_retries")
+    attempts = max(0, max_retries if isinstance(max_retries, int) else 0) + 1
     response = None
     try:
-        chat = client.chat.create(**create_kwargs)
-        for response, _chunk in chat.stream():
-            pass
-        if response is None:
-            module.fail_json(msg="The xAI stream ended before any response chunk arrived.")
-            return
+        for attempt in range(attempts):
+            response = None
+            try:
+                chat = client.chat.create(**create_kwargs)
+                for response, _chunk in chat.stream():
+                    pass
+                if response is None:
+                    module.fail_json(msg="The xAI stream ended before any response chunk arrived.")
+                    return
+                break
+            except Exception as exc:
+                if attempt + 1 < attempts and _is_transient(exc):
+                    response = None
+                    continue
+                raise
         module.exit_json(
             changed=False,
             **flatten_response(response, parse_structured=parse_structured),

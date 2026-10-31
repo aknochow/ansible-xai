@@ -58,6 +58,7 @@ def make_response(
         "total_tokens": 15,
         "reasoning_tokens": 0,
         "cached_prompt_text_tokens": 2,
+        "cost_in_usd_ticks": 0,
     }
     defaults.update(usage_kwargs or {})
     for key, value in defaults.items():
@@ -77,6 +78,7 @@ class TestFlattenResponse:
         assert result["tool_calls"] == []
         assert result["usage"]["prompt_tokens"] == 10
         assert result["usage"]["reasoning_tokens"] == 0
+        assert result["usage"]["cost_in_usd_ticks"] == 0
         assert "reasoning" not in result
 
     def test_reasoning_included_when_present(self, mock_xai_sdk):
@@ -158,6 +160,7 @@ class TestMain:
         assert create_kwargs["temperature"] == 0.7
         assert create_kwargs["top_p"] == 0.95
         assert create_kwargs["use_encrypted_content"] is True
+        assert create_kwargs["store_messages"] is False
         assert "reasoning_effort" not in create_kwargs
         assert "parallel_tool_calls" not in create_kwargs
         assert "response_format" not in create_kwargs
@@ -244,6 +247,7 @@ class TestMain:
         assert create_kwargs["parallel_tool_calls"] is False
         assert create_kwargs["reasoning_effort"] == "low"
         assert create_kwargs["use_encrypted_content"] is True
+        assert create_kwargs["store_messages"] is False
         assert create_kwargs["tool_choice"] == ("required", "get_weather")
         assert create_kwargs["tools"][0][1]["name"] == "get_weather"
         encoded = json.dumps(schema)
@@ -282,6 +286,44 @@ class TestMain:
         module.fail_json.assert_called_once()
         assert "mutually exclusive" in module.fail_json.call_args.kwargs["msg"]
         chat_module.get_client.assert_not_called()
+
+    def test_retries_a_transient_stream_reset(self, mock_xai_sdk):
+        from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module
+
+        mock_client = MagicMock()
+        failed = MagicMock()
+        failed.stream.side_effect = RuntimeError("StatusCode.INTERNAL RST_STREAM")
+        ok = MagicMock()
+        ok.stream.return_value = [(make_response(content="pong"), MagicMock())]
+        mock_client.chat.create.side_effect = [failed, ok]
+
+        module = MagicMock()
+        module.params = {
+            "model": "grok-4.7",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "api_key": "test-key",
+            "api_host": "api.x.ai",
+            "timeout": 30.0,
+            "max_retries": 2,
+            "temperature": None,
+            "top_p": None,
+            "stop_sequences": None,
+            "response_format": None,
+            "response_schema": None,
+            "tools": None,
+            "tool_choice": None,
+            "parallel_tool_calls": None,
+            "reasoning_effort": None,
+            "use_encrypted_content": True,
+        }
+        chat_module.AnsibleModule = MagicMock(return_value=module)
+        chat_module.get_client = MagicMock(return_value=mock_client)
+        chat_module.main()
+
+        module.exit_json.assert_called_once()
+        assert module.exit_json.call_args.kwargs["text"] == "pong"
+        assert mock_client.chat.create.call_count == 2
 
     def test_missing_api_key_in_main(self, mock_xai_sdk):
         from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module

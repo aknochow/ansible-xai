@@ -167,6 +167,56 @@ def test_assistant_encrypted_content_is_copied(mock_xai_sdk):
     assert result[0].encrypted_content == "opaque-blob"
 
 
+def test_assistant_tool_calls_and_tool_results_keep_their_ids(mock_xai_sdk):
+    class FunctionCall:
+        def __init__(self, name="", arguments=""):
+            self.name = name
+            self.arguments = arguments
+
+    class ToolCall:
+        def __init__(self, id="", function=None):
+            self.id = id
+            self.function = function
+
+    class Message:
+        def __init__(self, text):
+            self.text = text
+            self.encrypted_content = ""
+            self.tool_calls = []
+
+    proto = MagicMock()
+    proto.ToolCall = ToolCall
+    proto.FunctionCall = FunctionCall
+    proto_pkg = MagicMock()
+    proto_pkg.chat_pb2 = proto
+    sys.modules["xai_sdk.proto"] = proto_pkg
+    sys.modules["xai_sdk.proto.chat_pb2"] = proto
+    mock_xai_sdk.assistant = MagicMock(side_effect=Message)
+    mock_xai_sdk.tool_result = MagicMock(side_effect=lambda result, tool_call_id=None: ("tool_result", result, tool_call_id))
+
+    from ansible_collections.aknochow.xai.plugins.module_utils.grok_messages import (
+        ansible_messages_to_proto,
+    )
+
+    result = ansible_messages_to_proto(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "encrypted_content": "ENC1",
+                "tool_calls": [{"id": "call_1", "name": "read_file", "args": {"path": "a.py"}}],
+            },
+            {"role": "tool", "content": "RESULT_A", "tool_call_id": "call_1"},
+        ]
+    )
+
+    assert result[0].encrypted_content == "ENC1"
+    assert result[0].tool_calls[0].id == "call_1"
+    assert result[0].tool_calls[0].function.name == "read_file"
+    assert json.loads(result[0].tool_calls[0].function.arguments) == {"path": "a.py"}
+    assert result[1] == ("tool_result", "RESULT_A", "call_1")
+
+
 def test_tool_choice_string_and_named_function(mock_xai_sdk):
     from ansible_collections.aknochow.xai.plugins.module_utils.grok_messages import (
         tool_choice_for_sdk,
