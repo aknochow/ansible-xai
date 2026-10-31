@@ -10,21 +10,24 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def mock_xai_sdk():
+def mock_xai_sdk(monkeypatch):
     mock_sdk = MagicMock()
-    sys.modules["xai_sdk"] = mock_sdk
-    sys.modules["xai_sdk.chat"] = MagicMock()
-    sys.modules["xai_sdk.proto"] = MagicMock()
+    monkeypatch.setitem(sys.modules, "xai_sdk", mock_sdk)
+    monkeypatch.setitem(sys.modules, "xai_sdk.chat", MagicMock())
+    monkeypatch.setitem(sys.modules, "xai_sdk.proto", MagicMock())
     chat_pb2 = MagicMock()
     chat_pb2.FORMAT_TYPE_JSON_OBJECT = 1
     chat_pb2.FORMAT_TYPE_TEXT = 2
     chat_pb2.FORMAT_TYPE_JSON_SCHEMA = 3
     chat_pb2.ResponseFormat = MagicMock
-    sys.modules["xai_sdk.proto.chat_pb2"] = chat_pb2
-    yield mock_sdk
-    for name in list(sys.modules):
-        if name == "xai_sdk" or name.startswith("xai_sdk."):
-            sys.modules.pop(name, None)
+    monkeypatch.setitem(sys.modules, "xai_sdk.proto.chat_pb2", chat_pb2)
+
+    from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module
+
+    # TestMain assigns these on the shared module. Put the real ones back after each test.
+    monkeypatch.setattr(chat_module, "AnsibleModule", chat_module.AnsibleModule)
+    monkeypatch.setattr(chat_module, "get_client", chat_module.get_client)
+    return mock_sdk
 
 
 def make_tool_call(call_id="call_1", name="get_weather", arguments='{"city": "Boston"}'):
@@ -379,7 +382,7 @@ class TestMain:
             def __str__(self):
                 return "DEADLINE_EXCEEDED:Deadline Exceeded"
 
-        partial = make_response(content="partial answer")
+        partial = make_response(content="partial answer", finish_reason="REASON_INVALID")
 
         def chunks():
             yield partial, MagicMock()
@@ -590,7 +593,9 @@ class TestRetryBudget:
         assert module.exit_json.call_args.kwargs["text"] == "pong"
 
     def test_deadline_is_not_retried_and_keeps_partial_text(self, monkeypatch, clock):
-        partial = make_response(content="partial answer", usage_kwargs={"cost_in_usd_ticks": 7})
+        partial = make_response(
+            content="partial answer", finish_reason="REASON_INVALID", usage_kwargs={"cost_in_usd_ticks": 7}
+        )
         chats = [_attempt(partial, error=StatusError("DEADLINE_EXCEEDED")), _attempt()]
 
         module, client, _deadlines = self._run(monkeypatch, chats)
@@ -603,7 +608,7 @@ class TestRetryBudget:
 
     def test_partial_text_survives_a_retry_that_received_nothing(self, monkeypatch, clock):
         chats = [
-            _attempt(make_response(content="first try"), error=StatusError("INTERNAL")),
+            _attempt(make_response(content="first try", finish_reason="REASON_INVALID"), error=StatusError("INTERNAL")),
             _attempt(error=StatusError("DEADLINE_EXCEEDED")),
         ]
 
@@ -626,7 +631,10 @@ class TestRetryBudget:
         dropped_usage = {"prompt_tokens": 40, "total_tokens": 40, "cost_in_usd_ticks": 9}
         final_usage = {"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55, "cost_in_usd_ticks": 11}
         chats = [
-            _attempt(make_response(content="par", usage_kwargs=dropped_usage), error=StatusError("INTERNAL")),
+            _attempt(
+                make_response(content="par", finish_reason="REASON_INVALID", usage_kwargs=dropped_usage),
+                error=StatusError("INTERNAL"),
+            ),
             _attempt(error=StatusError("UNAVAILABLE")),
             _attempt(make_response(content="pong", usage_kwargs=final_usage)),
         ]
@@ -644,7 +652,10 @@ class TestRetryBudget:
 
     def test_attempts_on_final_failure(self, monkeypatch, clock):
         chats = [
-            _attempt(make_response(content="x", usage_kwargs={"total_tokens": 40}), error=StatusError("INTERNAL")),
+            _attempt(
+                make_response(content="x", finish_reason="REASON_INVALID", usage_kwargs={"total_tokens": 40}),
+                error=StatusError("INTERNAL"),
+            ),
             _attempt(error=StatusError("INTERNAL")),
         ]
 
@@ -675,3 +686,46 @@ class TestRetryBudget:
         assert secret not in json.dumps(failed)
         assert "<api_key>" in failed["msg"]
         assert "<api_key>" in failed["attempts"][0]["error"]
+
+    def test_flatten_failure_keeps_the_finished_text(self, monkeypatch, clock):
+        from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module
+
+        secret = "xai-secret-value"
+
+        def explode(_response, parse_structured=False):
+            raise ValueError(f"cannot serialize {secret}")
+
+        monkeypatch.setattr(chat_module, "flatten_response", explode)
+        chats = [_attempt(make_response(content="finished answer", usage_kwargs={"total_tokens": 15}))]
+
+        module, _client, _deadlines = self._run(monkeypatch, chats, api_key=secret)
+
+        module.exit_json.assert_not_called()
+        failed = module.fail_json.call_args.kwargs
+        assert failed["partial_text"] == "finished answer"
+        assert failed["attempts"] == [
+            {"usage": failed["attempts"][0]["usage"], "error": "cannot serialize <api_key>"}
+        ]
+        assert failed["attempts"][0]["usage"]["total_tokens"] == 15
+        assert secret not in json.dumps(failed)
+
+    def test_failing_close_does_not_mask_the_result(self, monkeypatch, clock):
+        client = MagicMock()
+        client.close.side_effect = RuntimeError("close failed")
+        client.chat.create.return_value = _attempt(make_response(content="pong"))
+        from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module
+
+        module = MagicMock()
+        module.params = {
+            "model": "grok-4.7",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "api_key": "test-key",
+            "timeout": 100.0,
+        }
+        monkeypatch.setattr(chat_module, "AnsibleModule", MagicMock(return_value=module))
+        monkeypatch.setattr(chat_module, "get_client", MagicMock(return_value=client))
+        chat_module.main()
+
+        module.fail_json.assert_not_called()
+        assert module.exit_json.call_args.kwargs["text"] == "pong"

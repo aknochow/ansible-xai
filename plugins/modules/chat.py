@@ -29,9 +29,12 @@ options:
     required: true
   messages:
     description:
-      - List of message objects, each with C(role) (V(system), V(user), or V(assistant)) and C(content).
+      - List of message objects, each with C(role) (V(system), V(user), V(assistant), or V(tool)) and C(content).
       - An assistant message may set C(encrypted_content) from a previous RV(encrypted_content).
       - Pass that string back unchanged so a follow-up turn keeps the earlier reasoning.
+      - An assistant message may set C(tool_calls) to the calls that turn made, each from a previous RV(tool_calls)
+        (C(id), C(name), C(args)) or in OpenAI shape (C(id), C(function.name), C(function.arguments)).
+      - A V(tool) message returns one result in C(content). Set C(tool_call_id) to the C(id) of the call it answers.
       - A user message may also set C(image_urls), a list of image URLs, and optional C(image_detail)
         (V(auto), V(low), or V(high)). Those are sent as image parts on that user turn.
         C(image_urls) is ignored on other roles and fails the task.
@@ -211,7 +214,9 @@ structured:
   type: dict
   returned: when structured output was requested and parsing succeeds
 finish_reason:
-  description: Why generation stopped.
+  description:
+    - Why generation stopped, for example V(REASON_STOP) or V(REASON_TOOL_CALLS).
+    - V(REASON_MAX_LEN) means O(max_tokens) cut the answer short. The task still succeeds, so check for it when that matters.
   type: str
   returned: always
 partial_text:
@@ -235,7 +240,8 @@ attempts:
       type: dict
     error:
       description:
-        - Failure text for this attempt with the API key redacted. V(null) when the attempt succeeded.
+        - Failure text for this attempt with the API key redacted. V(null) when the attempt succeeded with no error.
+        - On a successful result this can hold the error that ended the stream after the response had already finished.
       type: str
 usage:
   description: Token usage for the final response. Earlier attempts are reported in RV(attempts).
@@ -290,6 +296,7 @@ _BACKOFF_MAX_SECONDS = 8.0
 _TRANSIENT_STATUSES = frozenset({"INTERNAL", "UNAVAILABLE"})
 # gRPC reports some RST_STREAM drops under these statuses instead of INTERNAL.
 _RST_STREAM_STATUSES = frozenset({"UNKNOWN", "CANCELLED"})
+_NO_FINISH_REASON = "REASON_INVALID"
 _NEVER_RETRIED_TOKENS = (
     "DEADLINE_EXCEEDED",
     "UNAUTHENTICATED",
@@ -297,6 +304,10 @@ _NEVER_RETRIED_TOKENS = (
     "INVALID_ARGUMENT",
     "RESOURCE_EXHAUSTED",
 )
+
+
+class _StreamUnfinished(Exception):
+    """The stream closed cleanly before the response had a finish reason."""
 
 
 def flatten_tool_calls(tool_calls):
@@ -398,6 +409,8 @@ def _is_transient(exc: BaseException) -> bool:
     The status code decides when the exception has one. Text is only read for
     an RST_STREAM drop under a generic status and for exceptions with no code.
     """
+    if isinstance(exc, _StreamUnfinished):
+        return True
     text = str(exc)
     status = _status_name(exc)
     if status is not None:
@@ -430,6 +443,23 @@ def _received_usage(response):
     return usage if any(usage.values()) else None
 
 
+def _is_finished(response):
+    """True once the response carries a real finish reason, REASON_MAX_LEN included."""
+    try:
+        reason = getattr(response, "finish_reason", None)
+    except ValueError:
+        # The SDK cannot name an enum value it does not know.
+        return False
+    return isinstance(reason, str) and bool(reason) and reason != _NO_FINISH_REASON
+
+
+def _received_text(response, fallback):
+    try:
+        return getattr(response, "content", None) or fallback
+    except Exception:
+        return fallback
+
+
 def _redact(text, api_key):
     if api_key and api_key in text:
         return text.replace(api_key, "<api_key>")
@@ -442,6 +472,8 @@ def _close_client(client):
         try:
             close()
         except Exception:
+            # Nothing is left to do with a client that will not close, and this
+            # runs after the attempt, so it must not replace the attempt's result.
             pass
 
 
@@ -496,8 +528,15 @@ def main():
         return
     _close_client(client)
 
-    messages = ansible_messages_to_proto(module.params["messages"])
-    tools = tools_from_openai_shape(module.params.get("tools"))
+    api_key = module.params.get("api_key")
+    try:
+        messages = ansible_messages_to_proto(module.params["messages"])
+        tools = tools_from_openai_shape(module.params.get("tools"))
+    except Exception as exc:
+        reason = _redact(f"{type(exc).__name__}: {exc}", api_key)
+        module.fail_json(msg=f"Could not convert messages or tools to an xAI request. {reason}")
+        return
+
     schema = module.params.get("response_schema")
     response_format_param = module.params.get("response_format")
     try:
@@ -550,7 +589,6 @@ def main():
     max_attempts = max(0, max_retries if isinstance(max_retries, int) else 0) + 1
     budget = _or_default(module.params.get("timeout"), DEFAULT_TIMEOUT_SECONDS)
     deadline = started + budget
-    api_key = module.params.get("api_key")
 
     attempts = []
     partial = ""
@@ -577,12 +615,17 @@ def main():
                 attempts.append(dict(usage=None, error=msg))
                 module.fail_json(msg=msg, partial_text=partial, attempts=attempts)
                 return
+            if not _is_finished(response):
+                raise _StreamUnfinished("The xAI stream ended without a finish reason, so the response may be truncated.")
             attempts.append(dict(usage=_received_usage(response), error=None))
             break
         except Exception as exc:
             last_error = exc
             attempts.append(dict(usage=_received_usage(response), error=_redact(str(exc), api_key)))
-            partial = (getattr(response, "content", None) or "") or partial
+            if _is_finished(response):
+                # The answer was complete before the stream failed. A retry would pay for it again.
+                break
+            partial = _received_text(response, partial)
             if attempt + 1 < max_attempts and _is_transient(exc):
                 delay = _backoff_seconds(attempt)
                 if deadline - time.monotonic() - delay >= _MIN_ATTEMPT_SECONDS:
@@ -596,7 +639,8 @@ def main():
     try:
         result = flatten_response(response, parse_structured=parse_structured)
     except Exception as exc:
-        _fail(module, exc, budget, partial, attempts)
+        attempts[-1]["error"] = _redact(str(exc), api_key)
+        _fail(module, exc, budget, _received_text(response, partial), attempts)
         return
     module.exit_json(changed=False, attempts=attempts, **result)
 

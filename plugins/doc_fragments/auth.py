@@ -35,6 +35,8 @@ options:
     description:
       - Extra attempts after a transient gRPC failure, at most. The first call is not counted.
       - Retried statuses are UNAVAILABLE, INTERNAL, and RST_STREAM drops.
+      - A stream that closes with no finish reason is retried too.
+      - A response that already has a finish reason is kept, not retried, even if the stream then fails.
       - The gRPC status code decides when the error has one.
       - Authentication, invalid-argument, resource or quota, and deadline errors are never retried.
       - Attempts wait a short exponential backoff with jitter, and both the wait and the retry count against O(timeout).
@@ -46,5 +48,7 @@ options:
       - Stable id for one conversation. Sent as gRPC metadata C(x-grok-conv-id) on every call made with that client.
       - Reuse it for every turn of the same conversation so prompt-cache lookups stay on one server.
       - A different conversation, such as a separate verify loop, should use its own id.
+      - Must be printable ASCII with no newlines, as gRPC metadata requires.
+      - Any other value fails the task with no call made.
     type: str
 """

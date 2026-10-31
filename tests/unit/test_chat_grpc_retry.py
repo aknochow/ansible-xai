@@ -30,11 +30,16 @@ class ScriptedChat:
         self.steps = list(steps)
         self.deadlines = []
 
-    def chunk(self, text, **usage):
+    def chunk(self, text, finish=None, **usage):
         pb = self.chat_pb2
         return pb.GetChatCompletionChunk(
             id="local",
-            outputs=[pb.CompletionOutputChunk(delta=pb.Delta(content=text, role=pb.ROLE_ASSISTANT))],
+            outputs=[
+                pb.CompletionOutputChunk(
+                    delta=pb.Delta(content=text, role=pb.ROLE_ASSISTANT),
+                    finish_reason=finish or "REASON_INVALID",
+                )
+            ],
             usage=usage or None,
         )
 
@@ -43,9 +48,33 @@ class ScriptedChat:
         yield from self.steps.pop(0)(self, context)
 
 
-def text_then_stop(text, **usage):
+def text_then_stop(text, finish="REASON_STOP", **usage):
+    def step(servicer, _context):
+        yield servicer.chunk(text, finish=finish, **usage)
+
+    return step
+
+
+def clean_end(text, **usage):
+    """The stream closes with OK, but no chunk carried a finish reason."""
+
     def step(servicer, _context):
         yield servicer.chunk(text, **usage)
+
+    return step
+
+
+def usage_only_end(**usage):
+    def step(servicer, _context):
+        yield servicer.chat_pb2.GetChatCompletionChunk(id="local", usage=usage)
+
+    return step
+
+
+def finish_then_abort(text, status, details="late drop", finish="REASON_STOP", **usage):
+    def step(servicer, context):
+        yield servicer.chunk(text, finish=finish, **usage)
+        context.abort(status, details)
 
     return step
 
@@ -60,9 +89,9 @@ def abort(status, details="stream dropped", *, text=None, delay=0.0, **usage):
     return step
 
 
-def hang(text, seconds):
+def hang(text, seconds, finish=None):
     def step(servicer, _context):
-        yield servicer.chunk(text)
+        yield servicer.chunk(text, finish=finish)
         time.sleep(seconds)
 
     return step
@@ -78,8 +107,7 @@ def run_chat(monkeypatch):
     from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module
     from xai_sdk.proto import chat_pb2, chat_pb2_grpc
 
-    # test_chat replaces these on the shared module object, so set them here.
-    monkeypatch.setattr(chat_module, "get_client", grok_client.get_client)
+    assert chat_module.get_client is grok_client.get_client
     monkeypatch.setattr(xai_sdk, "Client", functools.partial(xai_sdk.Client, use_insecure_channel=True))
     monkeypatch.setattr(chat_module, "_BACKOFF_BASE_SECONDS", 0.01)
 
@@ -88,7 +116,7 @@ def run_chat(monkeypatch):
 
     servers = []
 
-    def run(steps, timeout=30.0, max_retries=2):
+    def run(steps, timeout=30.0, max_retries=2, **params):
         servicer = Servicer(chat_pb2, steps)
         server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
         chat_pb2_grpc.add_ChatServicer_to_server(servicer, server)
@@ -105,6 +133,7 @@ def run_chat(monkeypatch):
             "api_host": f"localhost:{port}",
             "timeout": timeout,
             "max_retries": max_retries,
+            **params,
         }
         monkeypatch.setattr(chat_module, "AnsibleModule", MagicMock(return_value=module))
         chat_module.main()
@@ -191,3 +220,127 @@ def test_real_midstream_drop_reports_received_usage_and_redacts(run_chat):
     assert SECRET not in failed["msg"]
     assert SECRET not in first["error"]
     assert "<api_key>" in failed["msg"]
+
+
+@pytest.mark.parametrize("status", [grpc.StatusCode.INTERNAL, grpc.StatusCode.UNAVAILABLE])
+@pytest.mark.parametrize("finish", ["REASON_STOP", "REASON_TOOL_CALLS"])
+def test_real_finished_response_survives_a_late_drop(run_chat, status, finish):
+    module, servicer = run_chat(
+        [finish_then_abort("done", status, f"late {SECRET}", finish=finish, total_tokens=9, cost_in_usd_ticks=3)]
+    )
+
+    module.fail_json.assert_not_called()
+    assert len(servicer.deadlines) == 1
+    result = module.exit_json.call_args.kwargs
+    assert result["text"] == "done"
+    assert result["finish_reason"] == finish
+    assert result["usage"]["cost_in_usd_ticks"] == 3
+    only = result["attempts"][0]
+    assert len(result["attempts"]) == 1
+    assert only["usage"] == result["usage"]
+    assert f"StatusCode.{status.name}" in only["error"]
+    assert SECRET not in only["error"]
+
+
+def test_real_finished_response_survives_the_deadline(run_chat):
+    module, servicer = run_chat([hang("done", 3.0, finish="REASON_STOP")], timeout=1.0)
+
+    module.fail_json.assert_not_called()
+    assert len(servicer.deadlines) == 1
+    result = module.exit_json.call_args.kwargs
+    assert result["text"] == "done"
+    assert "DEADLINE_EXCEEDED" in result["attempts"][0]["error"]
+
+
+def test_real_late_drop_without_a_finish_reason_is_still_retried(run_chat):
+    module, servicer = run_chat(
+        [abort(grpc.StatusCode.INTERNAL, text="trunc", total_tokens=4), text_then_stop("pong", total_tokens=9)]
+    )
+
+    assert len(servicer.deadlines) == 2
+    result = module.exit_json.call_args.kwargs
+    assert result["text"] == "pong"
+    assert "StatusCode.INTERNAL" in result["attempts"][0]["error"]
+    assert result["attempts"][1]["error"] is None
+
+
+@pytest.mark.parametrize(
+    "unfinished",
+    [clean_end("trunc", total_tokens=4), usage_only_end(total_tokens=4)],
+    ids=["truncated-text", "usage-only"],
+)
+def test_real_clean_end_without_a_finish_reason_is_retried(run_chat, unfinished):
+    module, servicer = run_chat([unfinished, text_then_stop("pong", total_tokens=9)])
+
+    module.fail_json.assert_not_called()
+    assert len(servicer.deadlines) == 2
+    result = module.exit_json.call_args.kwargs
+    assert result["text"] == "pong"
+    assert result["finish_reason"] == "REASON_STOP"
+    first, second = result["attempts"]
+    assert "finish reason" in first["error"]
+    assert first["usage"]["total_tokens"] == 4
+    assert second["error"] is None
+
+
+def test_real_clean_end_without_a_finish_reason_fails_with_partial_text(run_chat):
+    module, servicer = run_chat([clean_end("trunc")] * 2, max_retries=1)
+
+    module.exit_json.assert_not_called()
+    assert len(servicer.deadlines) == 2
+    failed = module.fail_json.call_args.kwargs
+    assert "finish reason" in failed["msg"]
+    assert failed["partial_text"] == "trunc"
+    assert [entry["error"] for entry in failed["attempts"]] == [failed["msg"]] * 2
+
+
+def test_real_max_len_is_returned_for_the_caller_to_flag(run_chat):
+    module, servicer = run_chat([text_then_stop("cut", finish="REASON_MAX_LEN", total_tokens=16)])
+
+    module.fail_json.assert_not_called()
+    assert len(servicer.deadlines) == 1
+    result = module.exit_json.call_args.kwargs
+    assert result["text"] == "cut"
+    assert result["finish_reason"] == "REASON_MAX_LEN"
+    assert result["attempts"][0]["error"] is None
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"messages": [{"role": "tool", "content": "x", "tool_call_id": 7}]},
+        {"messages": [{"role": 7, "content": "x"}]},
+        {"tools": [{"type": "function", "function": "not-a-dict"}]},
+    ],
+    ids=["integer-tool-call-id", "integer-role", "string-function"],
+)
+def test_real_bad_conversion_fails_clearly_without_a_call(run_chat, params):
+    module, servicer = run_chat([], **params)
+
+    assert servicer.deadlines == []
+    module.fail_json.assert_called_once()
+    assert module.fail_json.call_args.kwargs["msg"].startswith("Could not convert messages or tools")
+
+
+def test_conversion_failure_redacts_the_key(run_chat, monkeypatch):
+    from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module
+
+    def explode(_messages):
+        raise TypeError(f"bad value {SECRET}")
+
+    monkeypatch.setattr(chat_module, "ansible_messages_to_proto", explode)
+    module, servicer = run_chat([])
+
+    assert servicer.deadlines == []
+    msg = module.fail_json.call_args.kwargs["msg"]
+    assert SECRET not in msg
+    assert "<api_key>" in msg
+
+
+def test_real_invalid_conversation_id_makes_no_call(run_chat):
+    module, servicer = run_chat([], conversation_id="line\nbreak")
+
+    assert servicer.deadlines == []
+    module.fail_json.assert_called_once()
+    assert "conversation_id" in module.fail_json.call_args.kwargs["msg"]
+    module.exit_json.assert_not_called()

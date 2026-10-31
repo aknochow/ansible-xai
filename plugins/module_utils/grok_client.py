@@ -19,7 +19,7 @@ PROVIDER_ARGSPEC = dict(
         default="api.x.ai",
         fallback=(env_fallback, ["ANSIBLE_GROK_API_HOST"]),
     ),
-    timeout=dict(type="float", default=900.0),
+    timeout=dict(type="float", default=DEFAULT_TIMEOUT_SECONDS),
     max_retries=dict(type="int", default=2),
     conversation_id=dict(type="str", required=False),
 )
@@ -48,7 +48,12 @@ def get_client(module: AnsibleModule, timeout: float | None = None):
         timeout = DEFAULT_TIMEOUT_SECONDS
 
     api_host = module.params.get("api_host") or "api.x.ai"
-    conversation_id = (module.params.get("conversation_id") or "").strip()
+    conversation_id = module.params.get("conversation_id") or ""
+    # gRPC metadata values are printable ASCII. Anything else fails inside the call.
+    if not all(" " <= char <= "~" for char in conversation_id):
+        module.fail_json(msg="'conversation_id' must contain only printable ASCII characters, with no newlines")
+        return
+    conversation_id = conversation_id.strip()
     metadata = (("x-grok-conv-id", conversation_id),) if conversation_id else None
 
     return Client(
