@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from ansible.module_utils.basic import AnsibleModule, env_fallback
 
+# xAI's guide asks for at least 900s. The SDK's own default is 27 minutes, and
+# only applies when Client is constructed without timeout.
+DEFAULT_TIMEOUT_SECONDS = 900.0
+
 PROVIDER_ARGSPEC = dict(
     api_key=dict(
         type="str",
@@ -21,8 +25,12 @@ PROVIDER_ARGSPEC = dict(
 )
 
 
-def get_client(module: AnsibleModule):
-    """Construct an xai-sdk Client for the hosted xAI API."""
+def get_client(module: AnsibleModule, timeout: float | None = None):
+    """Construct an xai-sdk Client for the hosted xAI API.
+
+    The SDK applies a client's timeout to each RPC as a fresh deadline. Pass
+    timeout to override the module's O(timeout) for this client.
+    """
     try:
         from xai_sdk import Client
     except ImportError:
@@ -34,11 +42,10 @@ def get_client(module: AnsibleModule):
         module.fail_json(msg="'api_key' is required (set api_key or export GROK_API_KEY)")
         return
 
-    timeout = module.params.get("timeout")
     if timeout is None:
-        # xAI's guide asks for at least 900s. The SDK's own default is 27
-        # minutes, and only applies when Client is constructed without timeout.
-        timeout = 900.0
+        timeout = module.params.get("timeout")
+    if timeout is None:
+        timeout = DEFAULT_TIMEOUT_SECONDS
 
     api_host = module.params.get("api_host") or "api.x.ai"
     conversation_id = (module.params.get("conversation_id") or "").strip()

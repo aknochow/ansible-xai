@@ -406,3 +406,272 @@ class TestMain:
         failed = module.fail_json.call_args.kwargs
         assert "timeout of 900.0 seconds" in failed["msg"]
         assert failed["partial_text"] == "partial answer"
+
+
+class StatusError(Exception):
+    """Shaped like grpc.RpcError: a status from code() plus the status text."""
+
+    def __init__(self, status):
+        super().__init__(f"status = StatusCode.{status}, details = dropped")
+        self._status = status
+
+    def code(self):
+        return _Status(self._status)
+
+
+class _Status:
+    def __init__(self, name):
+        self.name = name
+
+
+class FakeTime:
+    def __init__(self):
+        self.now = 100.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _attempt(*chunks, error=None, duration=0.0, clock=None):
+    """One fake chat: yields chunks, spends duration on the clock, then maybe raises."""
+
+    def stream():
+        for chunk in chunks:
+            yield chunk, MagicMock()
+        if clock is not None:
+            clock.now += duration
+        if error is not None:
+            raise error
+
+    chat = MagicMock()
+    chat.stream.side_effect = stream
+    return chat
+
+
+class TestRetryBudget:
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module
+
+        fake = FakeTime()
+        monkeypatch.setattr(chat_module, "time", fake)
+        monkeypatch.setattr(chat_module.random, "uniform", lambda low, high: high)
+        return fake
+
+    def _run(self, monkeypatch, chats, timeout=100.0, max_retries=2, api_key="test-key"):
+        from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module
+
+        module = MagicMock()
+        module.params = {
+            "model": "grok-4.7",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "api_key": api_key,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+        client = MagicMock()
+        client.chat.create.side_effect = chats
+        get_client = MagicMock(return_value=client)
+        monkeypatch.setattr(chat_module, "AnsibleModule", MagicMock(return_value=module))
+        monkeypatch.setattr(chat_module, "get_client", get_client)
+        chat_module.main()
+        # The first get_client call only validates. Later ones carry a deadline.
+        deadlines = [c.kwargs["timeout"] for c in get_client.call_args_list[1:]]
+        return module, client, deadlines
+
+    def test_each_attempt_gets_only_the_remaining_time(self, monkeypatch, clock):
+        chats = [
+            _attempt(error=StatusError("INTERNAL"), duration=30.0, clock=clock),
+            _attempt(error=StatusError("UNAVAILABLE"), duration=20.0, clock=clock),
+            _attempt(make_response(content="pong")),
+        ]
+
+        module, _client, deadlines = self._run(monkeypatch, chats)
+
+        # Budget 100, less 30 spent and a 1s backoff, then 20 spent and a 2s backoff.
+        assert deadlines == [100.0, 69.0, 47.0]
+        assert clock.sleeps == [1.0, 2.0]
+        assert module.exit_json.call_args.kwargs["text"] == "pong"
+
+    def test_total_time_never_passes_the_budget(self, monkeypatch, clock):
+        """Each attempt runs until its deadline drops it. Three would be 300s without a budget."""
+        started = clock.now
+        deadlines_used = []
+
+        def create(**_kwargs):
+            deadline = deadlines_used[-1] if deadlines_used else None
+            return _attempt(error=StatusError("UNAVAILABLE"), duration=deadline, clock=clock)
+
+        from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module
+
+        module = MagicMock()
+        module.params = {
+            "model": "grok-4.7",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "api_key": "test-key",
+            "timeout": 100.0,
+            "max_retries": 2,
+        }
+
+        def get_client(_module, timeout=None):
+            deadlines_used.append(timeout)
+            client = MagicMock()
+            client.chat.create.side_effect = create
+            return client
+
+        monkeypatch.setattr(chat_module, "AnsibleModule", MagicMock(return_value=module))
+        monkeypatch.setattr(chat_module, "get_client", get_client)
+        chat_module.main()
+
+        assert clock.now - started <= 100.0
+        assert len(module.fail_json.call_args.kwargs["attempts"]) == 1
+
+    def test_backoff_counts_against_the_budget(self, monkeypatch, clock):
+        """10.5s is left, which is enough for an attempt but not after a 1s backoff."""
+        chats = [_attempt(error=StatusError("INTERNAL"), duration=89.5, clock=clock), _attempt()]
+
+        module, client, deadlines = self._run(monkeypatch, chats)
+
+        assert deadlines == [100.0]
+        assert client.chat.create.call_count == 1
+        assert clock.sleeps == []
+        failed = module.fail_json.call_args.kwargs
+        assert "StatusCode.INTERNAL" in failed["msg"]
+
+    def test_backoff_stays_bounded(self, monkeypatch, clock):
+        from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module
+
+        assert [chat_module._backoff_seconds(i) for i in range(6)] == [1.0, 2.0, 4.0, 8.0, 8.0, 8.0]
+
+    def test_backoff_has_jitter(self, monkeypatch):
+        from ansible_collections.aknochow.xai.plugins.modules import chat as chat_module
+
+        seen = {chat_module._backoff_seconds(2) for _round in range(20)}
+        assert len(seen) > 1
+        assert all(2.0 <= value <= 4.0 for value in seen)
+
+    @pytest.mark.parametrize(
+        "status",
+        ["UNAUTHENTICATED", "PERMISSION_DENIED", "INVALID_ARGUMENT", "RESOURCE_EXHAUSTED", "NOT_FOUND"],
+    )
+    def test_non_transient_status_is_not_retried(self, monkeypatch, clock, status):
+        chats = [_attempt(error=StatusError(status)), _attempt()]
+
+        module, client, _deadlines = self._run(monkeypatch, chats)
+
+        assert client.chat.create.call_count == 1
+        assert clock.sleeps == []
+        assert status in module.fail_json.call_args.kwargs["msg"]
+
+    def test_status_code_beats_the_text(self, monkeypatch, clock):
+        error = StatusError("INVALID_ARGUMENT")
+        error.args = ("prompt mentioned UNAVAILABLE and RST_STREAM",)
+        chats = [_attempt(error=error), _attempt()]
+
+        _module, client, _deadlines = self._run(monkeypatch, chats)
+
+        assert client.chat.create.call_count == 1
+
+    def test_rst_stream_under_a_generic_status_is_retried(self, monkeypatch, clock):
+        error = StatusError("UNKNOWN")
+        error.args = ("Stream removed: RST_STREAM with error code 2",)
+        chats = [_attempt(error=error), _attempt(make_response(content="pong"))]
+
+        module, client, _deadlines = self._run(monkeypatch, chats)
+
+        assert client.chat.create.call_count == 2
+        assert module.exit_json.call_args.kwargs["text"] == "pong"
+
+    def test_deadline_is_not_retried_and_keeps_partial_text(self, monkeypatch, clock):
+        partial = make_response(content="partial answer", usage_kwargs={"cost_in_usd_ticks": 7})
+        chats = [_attempt(partial, error=StatusError("DEADLINE_EXCEEDED")), _attempt()]
+
+        module, client, _deadlines = self._run(monkeypatch, chats)
+
+        assert client.chat.create.call_count == 1
+        failed = module.fail_json.call_args.kwargs
+        assert "client timeout of 100.0 seconds" in failed["msg"]
+        assert failed["partial_text"] == "partial answer"
+        assert failed["attempts"][0]["usage"]["cost_in_usd_ticks"] == 7
+
+    def test_partial_text_survives_a_retry_that_received_nothing(self, monkeypatch, clock):
+        chats = [
+            _attempt(make_response(content="first try"), error=StatusError("INTERNAL")),
+            _attempt(error=StatusError("DEADLINE_EXCEEDED")),
+        ]
+
+        module, _client, _deadlines = self._run(monkeypatch, chats)
+
+        failed = module.fail_json.call_args.kwargs
+        assert "client timeout" in failed["msg"]
+        assert failed["partial_text"] == "first try"
+
+    def test_no_budget_starts_no_attempt(self, monkeypatch, clock):
+        module, client, deadlines = self._run(monkeypatch, [_attempt()], timeout=0.0)
+
+        assert deadlines == []
+        client.chat.create.assert_not_called()
+        failed = module.fail_json.call_args.kwargs
+        assert "client timeout of 0.0 seconds" in failed["msg"]
+        assert failed["attempts"] == []
+
+    def test_attempts_on_success_after_a_retry(self, monkeypatch, clock):
+        dropped_usage = {"prompt_tokens": 40, "total_tokens": 40, "cost_in_usd_ticks": 9}
+        final_usage = {"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55, "cost_in_usd_ticks": 11}
+        chats = [
+            _attempt(make_response(content="par", usage_kwargs=dropped_usage), error=StatusError("INTERNAL")),
+            _attempt(error=StatusError("UNAVAILABLE")),
+            _attempt(make_response(content="pong", usage_kwargs=final_usage)),
+        ]
+
+        module, _client, _deadlines = self._run(monkeypatch, chats)
+
+        result = module.exit_json.call_args.kwargs
+        first, second, third = result["attempts"]
+        assert first["usage"]["cost_in_usd_ticks"] == 9
+        assert "StatusCode.INTERNAL" in first["error"]
+        assert second == {"usage": None, "error": "status = StatusCode.UNAVAILABLE, details = dropped"}
+        assert third["error"] is None
+        assert third["usage"] == result["usage"]
+        assert result["usage"]["cost_in_usd_ticks"] == 11
+
+    def test_attempts_on_final_failure(self, monkeypatch, clock):
+        chats = [
+            _attempt(make_response(content="x", usage_kwargs={"total_tokens": 40}), error=StatusError("INTERNAL")),
+            _attempt(error=StatusError("INTERNAL")),
+        ]
+
+        module, _client, _deadlines = self._run(monkeypatch, chats, max_retries=1)
+
+        failed = module.fail_json.call_args.kwargs
+        assert [entry["error"] is not None for entry in failed["attempts"]] == [True, True]
+        assert failed["attempts"][0]["usage"]["total_tokens"] == 40
+        assert failed["attempts"][1]["usage"] is None
+        assert failed["msg"] == "status = StatusCode.INTERNAL, details = dropped"
+
+    def test_empty_stream_is_recorded_and_not_retried(self, monkeypatch, clock):
+        module, client, _deadlines = self._run(monkeypatch, [_attempt(), _attempt()])
+
+        assert client.chat.create.call_count == 1
+        failed = module.fail_json.call_args.kwargs
+        assert failed["attempts"] == [{"usage": None, "error": failed["msg"]}]
+
+    def test_api_key_is_redacted_everywhere(self, monkeypatch, clock):
+        secret = "xai-secret-value"
+        error = StatusError("INTERNAL")
+        error.args = (f"INTERNAL bad key {secret}",)
+        chats = [_attempt(error=error), _attempt(error=error)]
+
+        module, _client, _deadlines = self._run(monkeypatch, chats, max_retries=1, api_key=secret)
+
+        failed = module.fail_json.call_args.kwargs
+        assert secret not in json.dumps(failed)
+        assert "<api_key>" in failed["msg"]
+        assert "<api_key>" in failed["attempts"][0]["error"]

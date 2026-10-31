@@ -17,6 +17,7 @@ description:
   - A client deadline then cancels the call with no text and no usage.
   - This is the SDK chat client, not the deprecated HTTP Chat Completions endpoint (C(POST /v1/chat/completions)).
   - Returns flattened convenience fields for use with C(register).
+  - O(timeout) is one budget for the whole module call. Retries and the backoff between them spend the same budget.
 version_added: "0.1.0"
 author:
   - Adam Knochowski (@aknochow)
@@ -213,10 +214,33 @@ finish_reason:
   description: Why generation stopped.
   type: str
   returned: always
+partial_text:
+  description:
+    - Text received before the call failed, or an empty string when none arrived.
+    - Comes from the most recent attempt that received any text.
+  type: str
+  returned: on failure after the request was started
+attempts:
+  description:
+    - One entry per attempt made, oldest first. The last entry is the attempt that decided the result.
+    - Use this to account for usage that RV(usage) does not cover, such as an attempt whose stream dropped.
+  type: list
+  elements: dict
+  returned: always once the request was started, on success and on failure
+  contains:
+    usage:
+      description:
+        - Usage received on this attempt, in the same shape as RV(usage).
+        - V(null) when the attempt received none. A dropped stream often reports none, and its cost is then unknown, not zero.
+      type: dict
+    error:
+      description:
+        - Failure text for this attempt with the API key redacted. V(null) when the attempt succeeded.
+      type: str
 usage:
-  description: Token usage for the request.
+  description: Token usage for the final response. Earlier attempts are reported in RV(attempts).
   type: dict
-  returned: always
+  returned: on success
   contains:
     prompt_tokens:
       description: Number of input tokens billed for this request.
@@ -233,12 +257,18 @@ usage:
     reasoning_tokens:
       description: Reasoning tokens billed for this request. Present even when zero.
       type: int
+    cost_in_usd_ticks:
+      description: Provider-reported cost of this request in USD ticks, or zero when not reported.
+      type: int
 """
 
 import json
+import random
+import time
 
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.aknochow.xai.plugins.module_utils.grok_client import (
+    DEFAULT_TIMEOUT_SECONDS,
     PROVIDER_ARGSPEC,
     get_client,
 )
@@ -250,6 +280,22 @@ from ansible_collections.aknochow.xai.plugins.module_utils.grok_messages import 
     response_format_from_schema,
     tool_choice_for_sdk,
     tools_from_openai_shape,
+)
+
+# A retry needs this much of the budget left once its backoff has been spent.
+_MIN_ATTEMPT_SECONDS = 10.0
+_BACKOFF_BASE_SECONDS = 1.0
+_BACKOFF_MAX_SECONDS = 8.0
+
+_TRANSIENT_STATUSES = frozenset({"INTERNAL", "UNAVAILABLE"})
+# gRPC reports some RST_STREAM drops under these statuses instead of INTERNAL.
+_RST_STREAM_STATUSES = frozenset({"UNKNOWN", "CANCELLED"})
+_NEVER_RETRIED_TOKENS = (
+    "DEADLINE_EXCEEDED",
+    "UNAUTHENTICATED",
+    "PERMISSION_DENIED",
+    "INVALID_ARGUMENT",
+    "RESOURCE_EXHAUSTED",
 )
 
 
@@ -334,32 +380,87 @@ def _or_default(value, default):
     return value
 
 
-def _is_transient(exc: BaseException) -> bool:
-    """True for a dropped stream the xAI SDK does not retry itself.
+def _status_name(exc: BaseException):
+    """Return the gRPC status name carried by an exception, or None."""
+    code = getattr(exc, "code", None)
+    if not callable(code):
+        return None
+    try:
+        name = getattr(code(), "name", None)
+    except Exception:
+        return None
+    return name if isinstance(name, str) else None
 
-    The SDK retries gRPC UNAVAILABLE. RST_STREAM and INTERNAL are not in that
-    set, and a deadline is not worth repeating.
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for a dropped stream that is worth another attempt.
+
+    The status code decides when the exception has one. Text is only read for
+    an RST_STREAM drop under a generic status and for exceptions with no code.
     """
-    if _deadline_exceeded(exc):
-        return False
     text = str(exc)
+    status = _status_name(exc)
+    if status is not None:
+        if status in _TRANSIENT_STATUSES:
+            return True
+        return status in _RST_STREAM_STATUSES and "RST_STREAM" in text
+    if any(token in text for token in _NEVER_RETRIED_TOKENS):
+        return False
     return any(token in text for token in ("UNAVAILABLE", "RST_STREAM", "StatusCode.INTERNAL"))
 
 
 def _deadline_exceeded(exc: BaseException) -> bool:
-    code = getattr(exc, "code", None)
-    if callable(code):
-        try:
-            status = code()
-        except Exception:
-            status = None
-        name = getattr(status, "name", None) or str(status or "")
-        if "DEADLINE_EXCEEDED" in name:
-            return True
+    status = _status_name(exc)
+    if status is not None:
+        return status == "DEADLINE_EXCEEDED"
     return "DEADLINE_EXCEEDED" in str(exc)
 
 
+def _backoff_seconds(retry_index: int) -> float:
+    """Exponential backoff with jitter, between half of the step and all of it."""
+    step = min(_BACKOFF_MAX_SECONDS, _BACKOFF_BASE_SECONDS * (2**retry_index))
+    return random.uniform(step / 2, step)
+
+
+def _received_usage(response):
+    """Flatten usage only if some arrived, so missing usage is not reported as zeros."""
+    if response is None:
+        return None
+    usage = flatten_usage(getattr(response, "usage", None))
+    return usage if any(usage.values()) else None
+
+
+def _redact(text, api_key):
+    if api_key and api_key in text:
+        return text.replace(api_key, "<api_key>")
+    return text
+
+
+def _close_client(client):
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _fail(module, exc, budget, partial, attempts):
+    """Report a final failure. exc is None when the budget ended with no error."""
+    if exc is None or _deadline_exceeded(exc):
+        msg = (
+            f"The xAI stream exceeded the client timeout of {budget} seconds "
+            "before the response finished."
+        )
+        if partial:
+            msg = f"{msg} Partial text ({len(partial)} characters) was received."
+    else:
+        msg = _redact(str(exc), module.params.get("api_key"))
+    module.fail_json(msg=msg, partial_text=partial, attempts=attempts)
+
+
 def main():
+    started = time.monotonic()
     argument_spec = dict(
         model=dict(type="str", required=True),
         messages=dict(type="list", elements="dict", required=True),
@@ -387,9 +488,13 @@ def main():
     if fail_on_invalid_request(module):
         return
 
+    # This client only validates the key and SDK. The xAI SDK fixes a client's
+    # deadline when it is built and applies it to every RPC, so each attempt
+    # below builds its own client with the time that is left.
     client = get_client(module)
     if client is None:
         return
+    _close_client(client)
 
     messages = ansible_messages_to_proto(module.params["messages"])
     tools = tools_from_openai_shape(module.params.get("tools"))
@@ -442,47 +547,58 @@ def main():
 
     parse_structured = schema is not None or bool(response_format_param)
     max_retries = module.params.get("max_retries")
-    attempts = max(0, max_retries if isinstance(max_retries, int) else 0) + 1
+    max_attempts = max(0, max_retries if isinstance(max_retries, int) else 0) + 1
+    budget = _or_default(module.params.get("timeout"), DEFAULT_TIMEOUT_SECONDS)
+    deadline = started + budget
+    api_key = module.params.get("api_key")
+
+    attempts = []
+    partial = ""
+    last_error = None
     response = None
-    try:
-        for attempt in range(attempts):
-            response = None
-            try:
-                chat = client.chat.create(**create_kwargs)
-                for response, _chunk in chat.stream():
-                    pass
-                if response is None:
-                    module.fail_json(msg="The xAI stream ended before any response chunk arrived.")
-                    return
-                break
-            except Exception as exc:
-                if attempt + 1 < attempts and _is_transient(exc):
-                    response = None
-                    continue
-                raise
-        module.exit_json(
-            changed=False,
-            **flatten_response(response, parse_structured=parse_structured),
-        )
-    except Exception as e:
-        msg = str(e)
-        api_key = module.params.get("api_key")
-        if api_key and api_key in msg:
-            msg = msg.replace(api_key, "<api_key>")
-        if _deadline_exceeded(e):
-            timeout = module.params.get("timeout")
-            partial = ""
-            if response is not None:
-                partial = getattr(response, "content", None) or ""
-            deadline_msg = (
-                f"The xAI stream exceeded the client timeout of {timeout} seconds "
-                "before the response finished."
-            )
-            if partial:
-                deadline_msg = f"{deadline_msg} Partial text ({len(partial)} characters) was received."
-            module.fail_json(msg=deadline_msg, partial_text=partial)
+    for attempt in range(max_attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Never hand the SDK a zero: it reads that as its 27 minute default.
+            _fail(module, last_error, budget, partial, attempts)
             return
-        module.fail_json(msg=msg)
+
+        response = None
+        attempt_client = None
+        try:
+            attempt_client = get_client(module, timeout=remaining)
+            if attempt_client is None:
+                return
+            chat = attempt_client.chat.create(**create_kwargs)
+            for response, _chunk in chat.stream():
+                pass
+            if response is None:
+                msg = "The xAI stream ended before any response chunk arrived."
+                attempts.append(dict(usage=None, error=msg))
+                module.fail_json(msg=msg, partial_text=partial, attempts=attempts)
+                return
+            attempts.append(dict(usage=_received_usage(response), error=None))
+            break
+        except Exception as exc:
+            last_error = exc
+            attempts.append(dict(usage=_received_usage(response), error=_redact(str(exc), api_key)))
+            partial = (getattr(response, "content", None) or "") or partial
+            if attempt + 1 < max_attempts and _is_transient(exc):
+                delay = _backoff_seconds(attempt)
+                if deadline - time.monotonic() - delay >= _MIN_ATTEMPT_SECONDS:
+                    time.sleep(delay)
+                    continue
+            _fail(module, exc, budget, partial, attempts)
+            return
+        finally:
+            _close_client(attempt_client)
+
+    try:
+        result = flatten_response(response, parse_structured=parse_structured)
+    except Exception as exc:
+        _fail(module, exc, budget, partial, attempts)
+        return
+    module.exit_json(changed=False, attempts=attempts, **result)
 
 
 if __name__ == "__main__":

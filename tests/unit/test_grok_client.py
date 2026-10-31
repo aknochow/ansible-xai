@@ -132,3 +132,14 @@ class TestGetClient:
         module.fail_json.assert_called_once()
         assert "xai-sdk" in module.fail_json.call_args.kwargs["msg"]
         assert result is None
+
+
+def test_timeout_argument_overrides_the_module_timeout(mock_xai_sdk):
+    from ansible_collections.aknochow.xai.plugins.module_utils.grok_client import get_client
+
+    module = MagicMock()
+    module.params = {"api_key": "test-key", "api_host": "api.x.ai", "timeout": 900.0}
+
+    get_client(module, timeout=12.5)
+
+    assert mock_xai_sdk.Client.call_args.kwargs["timeout"] == 12.5
