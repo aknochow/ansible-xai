@@ -350,6 +350,28 @@ def flatten_usage(usage):
     )
 
 
+def parse_structured_text(text):
+    """Return the JSON value in text, or None when text is not one value.
+
+    grok-4.7 has returned the same object twice in one response, so exact
+    repeats count as one value. Differing values stay unparsed, because
+    choosing one would be a guess.
+    """
+    decoder = json.JSONDecoder()
+    remaining = text.strip()
+    try:
+        value, end = decoder.raw_decode(remaining)
+        remaining = remaining[end:].lstrip()
+        while remaining:
+            repeat, end = decoder.raw_decode(remaining)
+            if repeat != value:
+                return None
+            remaining = remaining[end:].lstrip()
+    except ValueError:
+        return None
+    return value
+
+
 def flatten_response(response, parse_structured=False):
     # Imported here so ansible-test compile/import can load the module
     # without protobuf, which arrives only with xai-sdk at runtime.
@@ -361,10 +383,7 @@ def flatten_response(response, parse_structured=False):
 
     structured = None
     if parse_structured and text:
-        try:
-            structured = json.loads(text)
-        except (json.JSONDecodeError, ValueError):
-            structured = None
+        structured = parse_structured_text(text)
 
     raw = MessageToDict(response.proto, preserving_proto_field_name=True)
 

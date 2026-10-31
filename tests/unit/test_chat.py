@@ -113,6 +113,15 @@ class TestFlattenResponse:
 
         assert result["structured"] == payload
 
+    def test_structured_from_a_repeated_object(self, mock_xai_sdk):
+        from ansible_collections.aknochow.xai.plugins.modules.chat import flatten_response
+
+        text = '{"findings": []}{"findings": []}'
+        result = flatten_response(make_response(content=text), parse_structured=True)
+
+        assert result["structured"] == {"findings": []}
+        assert result["text"] == text
+
     def test_tool_calls_flattened(self, mock_xai_sdk):
         from ansible_collections.aknochow.xai.plugins.modules.chat import flatten_response
 
@@ -122,6 +131,25 @@ class TestFlattenResponse:
 
         assert result["tool_calls"][0]["name"] == "get_weather"
         assert result["tool_calls"][0]["args"] == {"city": "Boston"}
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('{"a": 1}', {"a": 1}),
+        (' {"a": 1}\n', {"a": 1}),
+        ('{"a": 1}{"a": 1}', {"a": 1}),
+        ('{"a": 1}\n{"a": 1}\n{"a": 1}', {"a": 1}),
+        ('{"a": 1}{"a": 2}', None),
+        ('{"a": 1} trailing', None),
+        ('{"a": 1}{"a":', None),
+        ("not json", None),
+    ],
+)
+def test_parse_structured_text(mock_xai_sdk, text, expected):
+    from ansible_collections.aknochow.xai.plugins.modules.chat import parse_structured_text
+
+    assert parse_structured_text(text) == expected
 
 
 class TestMain:
