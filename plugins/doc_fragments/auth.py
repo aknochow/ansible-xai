@@ -22,7 +22,9 @@ options:
     default: api.x.ai
   timeout:
     description:
-      - Client deadline in seconds for each xAI gRPC call, including C(chat.stream).
+      - Overall time budget in seconds for the module call, across every attempt and the backoff between them.
+      - Each attempt gets only the time that remains as its gRPC deadline.
+      - A retry that would have too little time left is not started.
       - High reasoning effort often runs for several minutes.
       - xAI recommends at least 900 seconds, and 1800 or more for long evals.
       - This replaces the SDK default of 27 minutes.
@@ -31,7 +33,22 @@ options:
     default: 900.0
   max_retries:
     description:
-      - Reserved for future SDK retry tuning. Currently documented for parity with sibling collections.
+      - Extra attempts after a transient gRPC failure, at most. The first call is not counted.
+      - Retried statuses are UNAVAILABLE, INTERNAL, and RST_STREAM drops.
+      - A stream that closes with no finish reason is retried too.
+      - A response that already has a finish reason is kept, not retried, even if the stream then fails.
+      - The gRPC status code decides when the error has one.
+      - Authentication, invalid-argument, resource or quota, and deadline errors are never retried.
+      - Attempts wait a short exponential backoff with jitter, and both the wait and the retry count against O(timeout).
+      - The xAI SDK itself retries UNAVAILABLE inside one attempt, under that attempt's deadline.
     type: int
     default: 2
+  conversation_id:
+    description:
+      - Stable id for one conversation. Sent as gRPC metadata C(x-grok-conv-id) on every call made with that client.
+      - Reuse it for every turn of the same conversation so prompt-cache lookups stay on one server.
+      - A different conversation, such as a separate verify loop, should use its own id.
+      - Must be printable ASCII with no newlines, as gRPC metadata requires.
+      - Any other value fails the task with no call made.
+    type: str
 """

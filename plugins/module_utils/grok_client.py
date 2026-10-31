@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from ansible.module_utils.basic import AnsibleModule, env_fallback
 
+# xAI's guide asks for at least 900s. The SDK's own default is 27 minutes, and
+# only applies when Client is constructed without timeout.
+DEFAULT_TIMEOUT_SECONDS = 900.0
+
 PROVIDER_ARGSPEC = dict(
     api_key=dict(
         type="str",
@@ -15,13 +19,18 @@ PROVIDER_ARGSPEC = dict(
         default="api.x.ai",
         fallback=(env_fallback, ["ANSIBLE_GROK_API_HOST"]),
     ),
-    timeout=dict(type="float", default=900.0),
+    timeout=dict(type="float", default=DEFAULT_TIMEOUT_SECONDS),
     max_retries=dict(type="int", default=2),
+    conversation_id=dict(type="str", required=False),
 )
 
 
-def get_client(module: AnsibleModule):
-    """Construct an xai-sdk Client for the hosted xAI API."""
+def get_client(module: AnsibleModule, timeout: float | None = None):
+    """Construct an xai-sdk Client for the hosted xAI API.
+
+    The SDK applies a client's timeout to each RPC as a fresh deadline. Pass
+    timeout to override the module's O(timeout) for this client.
+    """
     try:
         from xai_sdk import Client
     except ImportError:
@@ -33,16 +42,23 @@ def get_client(module: AnsibleModule):
         module.fail_json(msg="'api_key' is required (set api_key or export GROK_API_KEY)")
         return
 
-    timeout = module.params.get("timeout")
     if timeout is None:
-        # xAI's guide asks for at least 900s. The SDK's own default is 27
-        # minutes, and only applies when Client is constructed without timeout.
-        timeout = 900.0
+        timeout = module.params.get("timeout")
+    if timeout is None:
+        timeout = DEFAULT_TIMEOUT_SECONDS
 
     api_host = module.params.get("api_host") or "api.x.ai"
+    conversation_id = module.params.get("conversation_id") or ""
+    # gRPC metadata values are printable ASCII. Anything else fails inside the call.
+    if not all(" " <= char <= "~" for char in conversation_id):
+        module.fail_json(msg="'conversation_id' must contain only printable ASCII characters, with no newlines")
+        return
+    conversation_id = conversation_id.strip()
+    metadata = (("x-grok-conv-id", conversation_id),) if conversation_id else None
 
     return Client(
         api_key=api_key,
         api_host=api_host,
         timeout=timeout,
+        metadata=metadata,
     )

@@ -9,18 +9,15 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def mock_xai_sdk():
+def mock_xai_sdk(monkeypatch):
     mock_sdk = MagicMock()
     mock_client = MagicMock()
     mock_sdk.Client.return_value = mock_client
-    sys.modules["xai_sdk"] = mock_sdk
-    sys.modules["xai_sdk.chat"] = MagicMock()
-    sys.modules["xai_sdk.proto"] = MagicMock()
-    sys.modules["xai_sdk.proto.chat_pb2"] = MagicMock()
-    yield mock_sdk
-    for name in list(sys.modules):
-        if name == "xai_sdk" or name.startswith("xai_sdk."):
-            sys.modules.pop(name, None)
+    monkeypatch.setitem(sys.modules, "xai_sdk", mock_sdk)
+    monkeypatch.setitem(sys.modules, "xai_sdk.chat", MagicMock())
+    monkeypatch.setitem(sys.modules, "xai_sdk.proto", MagicMock())
+    monkeypatch.setitem(sys.modules, "xai_sdk.proto.chat_pb2", MagicMock())
+    return mock_sdk
 
 
 class TestProviderArgspec:
@@ -61,6 +58,29 @@ class TestGetClient:
             api_key="secret-key",
             api_host="api.x.ai",
             timeout=60.0,
+            metadata=None,
+        )
+
+    def test_conversation_id_sets_cache_metadata(self, mock_xai_sdk):
+        from ansible_collections.aknochow.xai.plugins.module_utils.grok_client import (
+            get_client,
+        )
+
+        module = MagicMock()
+        module.params = {
+            "api_key": "secret-key",
+            "api_host": "api.x.ai",
+            "timeout": 60.0,
+            "max_retries": 2,
+            "conversation_id": "review-1-explore",
+        }
+
+        get_client(module)
+        mock_xai_sdk.Client.assert_called_once_with(
+            api_key="secret-key",
+            api_host="api.x.ai",
+            timeout=60.0,
+            metadata=(("x-grok-conv-id", "review-1-explore"),),
         )
 
     def test_missing_api_key_fails(self, mock_xai_sdk):
@@ -109,3 +129,39 @@ class TestGetClient:
         module.fail_json.assert_called_once()
         assert "xai-sdk" in module.fail_json.call_args.kwargs["msg"]
         assert result is None
+
+
+def test_timeout_argument_overrides_the_module_timeout(mock_xai_sdk):
+    from ansible_collections.aknochow.xai.plugins.module_utils.grok_client import get_client
+
+    module = MagicMock()
+    module.params = {"api_key": "test-key", "api_host": "api.x.ai", "timeout": 900.0}
+
+    get_client(module, timeout=12.5)
+
+    assert mock_xai_sdk.Client.call_args.kwargs["timeout"] == 12.5
+
+
+@pytest.mark.parametrize("value", ["a\nb", "trailing\n", "tab\there", "caf\u00e9", "del\x7f"])
+def test_invalid_conversation_id_fails_before_any_client(mock_xai_sdk, value):
+    from ansible_collections.aknochow.xai.plugins.module_utils.grok_client import get_client
+
+    module = MagicMock()
+    module.params = {"api_key": "test-key", "timeout": 60.0, "conversation_id": value}
+
+    assert get_client(module) is None
+    assert "conversation_id" in module.fail_json.call_args.kwargs["msg"]
+    mock_xai_sdk.Client.assert_not_called()
+
+
+def test_every_printable_ascii_conversation_id_is_accepted(mock_xai_sdk):
+    from ansible_collections.aknochow.xai.plugins.module_utils.grok_client import get_client
+
+    value = "".join(chr(code) for code in range(0x21, 0x7f))
+    module = MagicMock()
+    module.params = {"api_key": "test-key", "timeout": 60.0, "conversation_id": value}
+
+    get_client(module)
+
+    module.fail_json.assert_not_called()
+    assert mock_xai_sdk.Client.call_args.kwargs["metadata"] == (("x-grok-conv-id", value),)

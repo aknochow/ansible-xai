@@ -10,7 +10,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def mock_xai_sdk():
+def mock_xai_sdk(monkeypatch):
     mock_chat = MagicMock()
     mock_chat.system = MagicMock(side_effect=lambda text: ("system", text))
     mock_chat.user = MagicMock(side_effect=lambda *args: ("user", args))
@@ -18,12 +18,9 @@ def mock_xai_sdk():
     mock_chat.tool = MagicMock(side_effect=lambda **kwargs: ("tool", kwargs))
     mock_chat.image = MagicMock(side_effect=lambda url, detail="auto": ("image", url, detail))
     mock_chat.required_tool = MagicMock(side_effect=lambda name: ("required_tool", name))
-    sys.modules["xai_sdk"] = MagicMock()
-    sys.modules["xai_sdk.chat"] = mock_chat
-    yield mock_chat
-    for name in list(sys.modules):
-        if name == "xai_sdk" or name.startswith("xai_sdk."):
-            sys.modules.pop(name, None)
+    monkeypatch.setitem(sys.modules, "xai_sdk", MagicMock())
+    monkeypatch.setitem(sys.modules, "xai_sdk.chat", mock_chat)
+    return mock_chat
 
 
 def test_ansible_messages_to_proto_roles(mock_xai_sdk):
@@ -66,7 +63,7 @@ def test_tools_from_openai_shape(mock_xai_sdk):
     assert tools[0][1]["name"] == "lookup"
 
 
-def test_json_schema_response_format_omits_name(mock_xai_sdk):
+def test_json_schema_response_format_omits_name(mock_xai_sdk, monkeypatch):
     """The live ResponseFormat proto accepts format_type and schema only."""
 
     class ResponseFormat:
@@ -79,8 +76,8 @@ def test_json_schema_response_format_omits_name(mock_xai_sdk):
     proto.ResponseFormat = ResponseFormat
     proto_pkg = MagicMock()
     proto_pkg.chat_pb2 = proto
-    sys.modules["xai_sdk.proto"] = proto_pkg
-    sys.modules["xai_sdk.proto.chat_pb2"] = proto
+    monkeypatch.setitem(sys.modules, "xai_sdk.proto", proto_pkg)
+    monkeypatch.setitem(sys.modules, "xai_sdk.proto.chat_pb2", proto)
 
     from ansible_collections.aknochow.xai.plugins.module_utils.grok_messages import (
         response_format_from_dict,
@@ -167,6 +164,58 @@ def test_assistant_encrypted_content_is_copied(mock_xai_sdk):
     assert result[0].encrypted_content == "opaque-blob"
 
 
+def test_assistant_tool_calls_and_tool_results_keep_their_ids(mock_xai_sdk, monkeypatch):
+    class FunctionCall:
+        def __init__(self, name="", arguments=""):
+            self.name = name
+            self.arguments = arguments
+
+    class ToolCall:
+        def __init__(self, id="", function=None):
+            self.id = id
+            self.function = function
+
+    class Message:
+        def __init__(self, text):
+            self.text = text
+            self.encrypted_content = ""
+            self.tool_calls = []
+
+    proto = MagicMock()
+    proto.ToolCall = ToolCall
+    proto.FunctionCall = FunctionCall
+    proto_pkg = MagicMock()
+    proto_pkg.chat_pb2 = proto
+    monkeypatch.setitem(sys.modules, "xai_sdk.proto", proto_pkg)
+    monkeypatch.setitem(sys.modules, "xai_sdk.proto.chat_pb2", proto)
+    mock_xai_sdk.assistant = MagicMock(side_effect=Message)
+    mock_xai_sdk.tool_result = MagicMock(
+        side_effect=lambda result, tool_call_id=None: ("tool_result", result, tool_call_id)
+    )
+
+    from ansible_collections.aknochow.xai.plugins.module_utils.grok_messages import (
+        ansible_messages_to_proto,
+    )
+
+    result = ansible_messages_to_proto(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "encrypted_content": "ENC1",
+                "tool_calls": [{"id": "call_1", "name": "read_file", "args": {"path": "a.py"}}],
+            },
+            {"role": "tool", "content": "RESULT_A", "tool_call_id": "call_1"},
+        ]
+    )
+
+    assert result[0].encrypted_content == "ENC1"
+    assert result[0].tool_calls[0].id == "call_1"
+    assert result[0].tool_calls[0].function.name == "read_file"
+    assert json.loads(result[0].tool_calls[0].function.arguments) == {"path": "a.py"}
+    assert result[1] == ("tool_result", "RESULT_A", "call_1")
+
+
 def test_tool_choice_string_and_named_function(mock_xai_sdk):
     from ansible_collections.aknochow.xai.plugins.module_utils.grok_messages import (
         tool_choice_for_sdk,
@@ -187,7 +236,7 @@ def test_tool_choice_rejects_unknown_string(mock_xai_sdk):
         tool_choice_for_sdk("always")
 
 
-def test_response_schema_is_json_not_a_pydantic_class(mock_xai_sdk):
+def test_response_schema_is_json_not_a_pydantic_class(mock_xai_sdk, monkeypatch):
     import sys
 
     proto = MagicMock()
@@ -195,8 +244,8 @@ def test_response_schema_is_json_not_a_pydantic_class(mock_xai_sdk):
     chat_pb2.FORMAT_TYPE_JSON_SCHEMA = "json_schema"
     chat_pb2.ResponseFormat = lambda **kwargs: ("format", kwargs)
     proto.chat_pb2 = chat_pb2
-    sys.modules["xai_sdk.proto"] = proto
-    sys.modules["xai_sdk.proto.chat_pb2"] = chat_pb2
+    monkeypatch.setitem(sys.modules, "xai_sdk.proto", proto)
+    monkeypatch.setitem(sys.modules, "xai_sdk.proto.chat_pb2", chat_pb2)
 
     from ansible_collections.aknochow.xai.plugins.module_utils.grok_messages import (
         response_format_from_schema,

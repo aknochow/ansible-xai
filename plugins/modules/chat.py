@@ -17,6 +17,7 @@ description:
   - A client deadline then cancels the call with no text and no usage.
   - This is the SDK chat client, not the deprecated HTTP Chat Completions endpoint (C(POST /v1/chat/completions)).
   - Returns flattened convenience fields for use with C(register).
+  - O(timeout) is one budget for the whole module call. Retries and the backoff between them spend the same budget.
 version_added: "0.1.0"
 author:
   - Adam Knochowski (@aknochow)
@@ -28,9 +29,12 @@ options:
     required: true
   messages:
     description:
-      - List of message objects, each with C(role) (V(system), V(user), or V(assistant)) and C(content).
+      - List of message objects, each with C(role) (V(system), V(user), V(assistant), or V(tool)) and C(content).
       - An assistant message may set C(encrypted_content) from a previous RV(encrypted_content).
       - Pass that string back unchanged so a follow-up turn keeps the earlier reasoning.
+      - An assistant message may set C(tool_calls) to the calls that turn made, each from a previous RV(tool_calls)
+        (C(id), C(name), C(args)) or in OpenAI shape (C(id), C(function.name), C(function.arguments)).
+      - A V(tool) message returns one result in C(content). Set C(tool_call_id) to the C(id) of the call it answers.
       - A user message may also set C(image_urls), a list of image URLs, and optional C(image_detail)
         (V(auto), V(low), or V(high)). Those are sent as image parts on that user turn.
         C(image_urls) is ignored on other roles and fails the task.
@@ -210,13 +214,39 @@ structured:
   type: dict
   returned: when structured output was requested and parsing succeeds
 finish_reason:
-  description: Why generation stopped.
+  description:
+    - Why generation stopped, for example V(REASON_STOP) or V(REASON_TOOL_CALLS).
+    - V(REASON_MAX_LEN) means O(max_tokens) cut the answer short. The task still succeeds, so check for it when that matters.
   type: str
   returned: always
+partial_text:
+  description:
+    - Text received before the call failed, or an empty string when none arrived.
+    - Comes from the most recent attempt that received any text.
+  type: str
+  returned: on failure after the request was started
+attempts:
+  description:
+    - One entry per attempt made, oldest first. The last entry is the attempt that decided the result.
+    - Use this to account for usage that RV(usage) does not cover, such as an attempt whose stream dropped.
+  type: list
+  elements: dict
+  returned: always once the request was started, on success and on failure
+  contains:
+    usage:
+      description:
+        - Usage received on this attempt, in the same shape as RV(usage).
+        - V(null) when the attempt received none. A dropped stream often reports none, and its cost is then unknown, not zero.
+      type: dict
+    error:
+      description:
+        - Failure text for this attempt with the API key redacted. V(null) when the attempt succeeded with no error.
+        - On a successful result this can hold the error that ended the stream after the response had already finished.
+      type: str
 usage:
-  description: Token usage for the request.
+  description: Token usage for the final response. Earlier attempts are reported in RV(attempts).
   type: dict
-  returned: always
+  returned: on success
   contains:
     prompt_tokens:
       description: Number of input tokens billed for this request.
@@ -233,12 +263,18 @@ usage:
     reasoning_tokens:
       description: Reasoning tokens billed for this request. Present even when zero.
       type: int
+    cost_in_usd_ticks:
+      description: Provider-reported cost of this request in USD ticks, or zero when not reported.
+      type: int
 """
 
 import json
+import random
+import time
 
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.aknochow.xai.plugins.module_utils.grok_client import (
+    DEFAULT_TIMEOUT_SECONDS,
     PROVIDER_ARGSPEC,
     get_client,
 )
@@ -251,6 +287,27 @@ from ansible_collections.aknochow.xai.plugins.module_utils.grok_messages import 
     tool_choice_for_sdk,
     tools_from_openai_shape,
 )
+
+# A retry needs this much of the budget left once its backoff has been spent.
+_MIN_ATTEMPT_SECONDS = 10.0
+_BACKOFF_BASE_SECONDS = 1.0
+_BACKOFF_MAX_SECONDS = 8.0
+
+_TRANSIENT_STATUSES = frozenset({"INTERNAL", "UNAVAILABLE"})
+# gRPC reports some RST_STREAM drops under these statuses instead of INTERNAL.
+_RST_STREAM_STATUSES = frozenset({"UNKNOWN", "CANCELLED"})
+_NO_FINISH_REASON = "REASON_INVALID"
+_NEVER_RETRIED_TOKENS = (
+    "DEADLINE_EXCEEDED",
+    "UNAUTHENTICATED",
+    "PERMISSION_DENIED",
+    "INVALID_ARGUMENT",
+    "RESOURCE_EXHAUSTED",
+)
+
+
+class _StreamUnfinished(Exception):
+    """The stream closed cleanly before the response had a finish reason."""
 
 
 def flatten_tool_calls(tool_calls):
@@ -268,16 +325,28 @@ def flatten_tool_calls(tool_calls):
     return flattened
 
 
+def _usage_int(usage, name):
+    value = getattr(usage, name, 0)
+    return value if isinstance(value, int) else 0
+
+
 def flatten_usage(usage):
     if usage is None:
-        return dict(prompt_tokens=0, completion_tokens=0, total_tokens=0, cached_tokens=0)
-    cached = getattr(usage, "cached_prompt_text_tokens", 0) or 0
+        return dict(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            cached_tokens=0,
+            reasoning_tokens=0,
+            cost_in_usd_ticks=0,
+        )
     return dict(
-        prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-        completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
-        total_tokens=getattr(usage, "total_tokens", 0) or 0,
-        cached_tokens=cached,
-        reasoning_tokens=getattr(usage, "reasoning_tokens", 0) or 0,
+        prompt_tokens=_usage_int(usage, "prompt_tokens"),
+        completion_tokens=_usage_int(usage, "completion_tokens"),
+        total_tokens=_usage_int(usage, "total_tokens"),
+        cached_tokens=_usage_int(usage, "cached_prompt_text_tokens"),
+        reasoning_tokens=_usage_int(usage, "reasoning_tokens"),
+        cost_in_usd_ticks=_usage_int(usage, "cost_in_usd_ticks"),
     )
 
 
@@ -322,20 +391,108 @@ def _or_default(value, default):
     return value
 
 
-def _deadline_exceeded(exc: BaseException) -> bool:
+def _status_name(exc: BaseException):
+    """Return the gRPC status name carried by an exception, or None."""
     code = getattr(exc, "code", None)
-    if callable(code):
-        try:
-            status = code()
-        except Exception:
-            status = None
-        name = getattr(status, "name", None) or str(status or "")
-        if "DEADLINE_EXCEEDED" in name:
+    if not callable(code):
+        return None
+    try:
+        name = getattr(code(), "name", None)
+    except Exception:
+        return None
+    return name if isinstance(name, str) else None
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for a dropped stream that is worth another attempt.
+
+    The status code decides when the exception has one. Text is only read for
+    an RST_STREAM drop under a generic status and for exceptions with no code.
+    """
+    if isinstance(exc, _StreamUnfinished):
+        return True
+    text = str(exc)
+    status = _status_name(exc)
+    if status is not None:
+        if status in _TRANSIENT_STATUSES:
             return True
+        return status in _RST_STREAM_STATUSES and "RST_STREAM" in text
+    if any(token in text for token in _NEVER_RETRIED_TOKENS):
+        return False
+    return any(token in text for token in ("UNAVAILABLE", "RST_STREAM", "StatusCode.INTERNAL"))
+
+
+def _deadline_exceeded(exc: BaseException) -> bool:
+    status = _status_name(exc)
+    if status is not None:
+        return status == "DEADLINE_EXCEEDED"
     return "DEADLINE_EXCEEDED" in str(exc)
 
 
+def _backoff_seconds(retry_index: int) -> float:
+    """Exponential backoff with jitter, between half of the step and all of it."""
+    step = min(_BACKOFF_MAX_SECONDS, _BACKOFF_BASE_SECONDS * (2**retry_index))
+    return random.uniform(step / 2, step)
+
+
+def _received_usage(response):
+    """Flatten usage only if some arrived, so missing usage is not reported as zeros."""
+    if response is None:
+        return None
+    usage = flatten_usage(getattr(response, "usage", None))
+    return usage if any(usage.values()) else None
+
+
+def _is_finished(response):
+    """True once the response carries a real finish reason, REASON_MAX_LEN included."""
+    try:
+        reason = getattr(response, "finish_reason", None)
+    except ValueError:
+        # The SDK cannot name an enum value it does not know.
+        return False
+    return isinstance(reason, str) and bool(reason) and reason != _NO_FINISH_REASON
+
+
+def _received_text(response, fallback):
+    try:
+        return getattr(response, "content", None) or fallback
+    except Exception:
+        return fallback
+
+
+def _redact(text, api_key):
+    if api_key and api_key in text:
+        return text.replace(api_key, "<api_key>")
+    return text
+
+
+def _close_client(client):
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            # Nothing is left to do with a client that will not close, and this
+            # runs after the attempt, so it must not replace the attempt's result.
+            pass
+
+
+def _fail(module, exc, budget, partial, attempts):
+    """Report a final failure. exc is None when the budget ended with no error."""
+    if exc is None or _deadline_exceeded(exc):
+        msg = (
+            f"The xAI stream exceeded the client timeout of {budget} seconds "
+            "before the response finished."
+        )
+        if partial:
+            msg = f"{msg} Partial text ({len(partial)} characters) was received."
+    else:
+        msg = _redact(str(exc), module.params.get("api_key"))
+    module.fail_json(msg=msg, partial_text=partial, attempts=attempts)
+
+
 def main():
+    started = time.monotonic()
     argument_spec = dict(
         model=dict(type="str", required=True),
         messages=dict(type="list", elements="dict", required=True),
@@ -363,12 +520,23 @@ def main():
     if fail_on_invalid_request(module):
         return
 
+    # This client only validates the key and SDK. The xAI SDK fixes a client's
+    # deadline when it is built and applies it to every RPC, so each attempt
+    # below builds its own client with the time that is left.
     client = get_client(module)
     if client is None:
         return
+    _close_client(client)
 
-    messages = ansible_messages_to_proto(module.params["messages"])
-    tools = tools_from_openai_shape(module.params.get("tools"))
+    api_key = module.params.get("api_key")
+    try:
+        messages = ansible_messages_to_proto(module.params["messages"])
+        tools = tools_from_openai_shape(module.params.get("tools"))
+    except Exception as exc:
+        reason = _redact(f"{type(exc).__name__}: {exc}", api_key)
+        module.fail_json(msg=f"Could not convert messages or tools to an xAI request. {reason}")
+        return
+
     schema = module.params.get("response_schema")
     response_format_param = module.params.get("response_format")
     try:
@@ -391,6 +559,8 @@ def main():
         temperature=_or_default(module.params.get("temperature"), 0.7),
         top_p=_or_default(module.params.get("top_p"), 0.95),
         use_encrypted_content=_or_default(module.params.get("use_encrypted_content"), True),
+        # Each request already carries the full history. Do not keep a server copy.
+        store_messages=False,
     )
 
     stop_sequences = module.params.get("stop_sequences")
@@ -415,37 +585,64 @@ def main():
         create_kwargs["response_format"] = response_format
 
     parse_structured = schema is not None or bool(response_format_param)
+    max_retries = module.params.get("max_retries")
+    max_attempts = max(0, max_retries if isinstance(max_retries, int) else 0) + 1
+    budget = _or_default(module.params.get("timeout"), DEFAULT_TIMEOUT_SECONDS)
+    deadline = started + budget
+
+    attempts = []
+    partial = ""
+    last_error = None
     response = None
+    for attempt in range(max_attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Never hand the SDK a zero: it reads that as its 27 minute default.
+            _fail(module, last_error, budget, partial, attempts)
+            return
+
+        response = None
+        attempt_client = None
+        try:
+            attempt_client = get_client(module, timeout=remaining)
+            if attempt_client is None:
+                return
+            chat = attempt_client.chat.create(**create_kwargs)
+            for response, _chunk in chat.stream():
+                pass
+            if response is None:
+                msg = "The xAI stream ended before any response chunk arrived."
+                attempts.append(dict(usage=None, error=msg))
+                module.fail_json(msg=msg, partial_text=partial, attempts=attempts)
+                return
+            if not _is_finished(response):
+                raise _StreamUnfinished("The xAI stream ended without a finish reason, so the response may be truncated.")
+            attempts.append(dict(usage=_received_usage(response), error=None))
+            break
+        except Exception as exc:
+            last_error = exc
+            attempts.append(dict(usage=_received_usage(response), error=_redact(str(exc), api_key)))
+            if _is_finished(response):
+                # The answer was complete before the stream failed. A retry would pay for it again.
+                break
+            partial = _received_text(response, partial)
+            if attempt + 1 < max_attempts and _is_transient(exc):
+                delay = _backoff_seconds(attempt)
+                if deadline - time.monotonic() - delay >= _MIN_ATTEMPT_SECONDS:
+                    time.sleep(delay)
+                    continue
+            _fail(module, exc, budget, partial, attempts)
+            return
+        finally:
+            _close_client(attempt_client)
+
     try:
-        chat = client.chat.create(**create_kwargs)
-        for response, _chunk in chat.stream():
-            pass
-        if response is None:
-            module.fail_json(msg="The xAI stream ended before any response chunk arrived.")
-            return
-        module.exit_json(
-            changed=False,
-            **flatten_response(response, parse_structured=parse_structured),
-        )
-    except Exception as e:
-        msg = str(e)
-        api_key = module.params.get("api_key")
-        if api_key and api_key in msg:
-            msg = msg.replace(api_key, "<api_key>")
-        if _deadline_exceeded(e):
-            timeout = module.params.get("timeout")
-            partial = ""
-            if response is not None:
-                partial = getattr(response, "content", None) or ""
-            deadline_msg = (
-                f"The xAI stream exceeded the client timeout of {timeout} seconds "
-                "before the response finished."
-            )
-            if partial:
-                deadline_msg = f"{deadline_msg} Partial text ({len(partial)} characters) was received."
-            module.fail_json(msg=deadline_msg, partial_text=partial)
-            return
-        module.fail_json(msg=msg)
+        result = flatten_response(response, parse_structured=parse_structured)
+    except Exception as exc:
+        attempts[-1]["error"] = _redact(str(exc), api_key)
+        _fail(module, exc, budget, _received_text(response, partial), attempts)
+        return
+    module.exit_json(changed=False, attempts=attempts, **result)
 
 
 if __name__ == "__main__":
