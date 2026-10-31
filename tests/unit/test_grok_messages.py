@@ -192,7 +192,9 @@ def test_assistant_tool_calls_and_tool_results_keep_their_ids(mock_xai_sdk):
     sys.modules["xai_sdk.proto"] = proto_pkg
     sys.modules["xai_sdk.proto.chat_pb2"] = proto
     mock_xai_sdk.assistant = MagicMock(side_effect=Message)
-    mock_xai_sdk.tool_result = MagicMock(side_effect=lambda result, tool_call_id=None: ("tool_result", result, tool_call_id))
+    mock_xai_sdk.tool_result = MagicMock(
+        side_effect=lambda result, tool_call_id=None: ("tool_result", result, tool_call_id)
+    )
 
     from ansible_collections.aknochow.xai.plugins.module_utils.grok_messages import (
         ansible_messages_to_proto,
